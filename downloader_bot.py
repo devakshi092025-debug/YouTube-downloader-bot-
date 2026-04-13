@@ -29,16 +29,28 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
-    return "🎬 Social Media Downloader Bot is Running! ✅"
+    return "🎬 Downloader Bot Running! ✅", 200
 
 @flask_app.route("/health")
 def health():
     return "OK", 200
 
+@flask_app.route("/ping")
+def ping():
+    return "pong", 200
+
 def keep_alive():
-    t = threading.Thread(
-        target=lambda: flask_app.run(host="0.0.0.0", port=PORT)
-    )
+    def run():
+        try:
+            flask_app.run(
+                host="0.0.0.0",
+                port=PORT,
+                debug=False,
+                use_reloader=False
+            )
+        except Exception as e:
+            log.error(f"Flask error: {e}")
+    t = threading.Thread(target=run)
     t.daemon = True
     t.start()
     log.info(f"Keep-alive started on port {PORT}")
@@ -62,48 +74,56 @@ def detect_platform(url: str) -> str:
         return "unknown"
 
 
-def get_video_info(url: str) -> dict:
+def format_size(bytes_val):
+    """Convert bytes to human readable size"""
+    if not bytes_val:
+        return "N/A"
+    if bytes_val >= 1024 * 1024 * 1024:
+        return f"{bytes_val / (1024*1024*1024):.1f}GB"
+    elif bytes_val >= 1024 * 1024:
+        return f"{bytes_val / (1024*1024):.0f}MB"
+    else:
+        return f"{bytes_val / 1024:.0f}KB"
+
+
+def get_video_data(url: str) -> dict:
+    """Get full video info + all formats with sizes"""
     try:
         result = subprocess.run([
             "yt-dlp",
             "--no-playlist",
+            "--no-warnings",
+            "--extractor-args", "youtube:player_client=android",
             "-J",
             url
         ], capture_output=True, text=True, timeout=60)
+
+        if not result.stdout.strip():
+            return None
+
         data = json.loads(result.stdout)
+
+        # Get basic info
         duration_secs = data.get("duration", 0) or 0
         mins = int(duration_secs // 60)
         secs = int(duration_secs % 60)
-        return {
+
+        info = {
             "title": data.get("title", "Unknown"),
-            "duration": f"{mins}m {secs}s",
-            "uploader": data.get("uploader", "Unknown")
-        }
-    except Exception as e:
-        log.error(f"get_video_info error: {e}")
-        return {
-            "title": "Unknown",
-            "duration": "Unknown",
-            "uploader": "Unknown"
+            "duration": f"{mins}:{secs:02d}",
+            "uploader": data.get("uploader", "Unknown"),
+            "thumbnail": data.get("thumbnail", ""),
+            "view_count": data.get("view_count", 0),
         }
 
-
-def get_video_formats(url: str) -> list:
-    try:
-        result = subprocess.run([
-            "yt-dlp",
-            "--no-playlist",
-            "-J",
-            url
-        ], capture_output=True, text=True, timeout=60)
-
-        data = json.loads(result.stdout)
+        # Get formats with sizes
         formats = []
         seen_heights = set()
 
         for f in data.get("formats", []):
             height = f.get("height")
             vcodec = f.get("vcodec", "none")
+            filesize = f.get("filesize") or f.get("filesize_approx") or 0
 
             if not height or vcodec == "none":
                 continue
@@ -113,31 +133,38 @@ def get_video_formats(url: str) -> list:
             seen_heights.add(height)
             quality = f"{height}p"
             formats.append({
-                "format_id": str(f.get("format_id", "")),
                 "quality": quality,
-                "ext": "mp4",
-                "label": f"📹 {quality}"
+                "height": height,
+                "filesize": filesize,
+                "size_str": format_size(filesize),
+                "ext": "mp4"
             })
 
         # Sort highest to lowest
-        formats.sort(
-            key=lambda x: int(x["quality"].replace("p", "")),
-            reverse=True
-        )
+        formats.sort(key=lambda x: x["height"], reverse=True)
 
-        # Add audio only
+        # Add MP3 audio
+        # Try to get audio size
+        audio_size = 0
+        for f in data.get("formats", []):
+            if f.get("acodec", "none") != "none" and f.get("vcodec") == "none":
+                audio_size = f.get("filesize") or f.get("filesize_approx") or 0
+                if audio_size:
+                    break
+
         formats.append({
-            "format_id": "bestaudio",
             "quality": "audio",
-            "ext": "mp3",
-            "label": "🎵 Audio Only (MP3)"
+            "height": 0,
+            "filesize": audio_size,
+            "size_str": format_size(audio_size),
+            "ext": "mp3"
         })
 
-        return formats
+        return {"info": info, "formats": formats}
 
     except Exception as e:
-        log.error(f"get_video_formats error: {e}")
-        return []
+        log.error(f"get_video_data error: {e}")
+        return None
 
 
 def download_video(url: str, quality: str, out_path: str) -> bool:
@@ -146,6 +173,8 @@ def download_video(url: str, quality: str, out_path: str) -> bool:
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
+                "--no-warnings",
+                "--extractor-args", "youtube:player_client=android",
                 "-x", "--audio-format", "mp3",
                 "--audio-quality", "0",
                 "-o", out_path,
@@ -156,6 +185,8 @@ def download_video(url: str, quality: str, out_path: str) -> bool:
             cmd = [
                 "yt-dlp",
                 "--no-playlist",
+                "--no-warnings",
+                "--extractor-args", "youtube:player_client=android",
                 "-f", f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
                 "--merge-output-format", "mp4",
                 "-o", out_path,
@@ -172,23 +203,46 @@ def download_video(url: str, quality: str, out_path: str) -> bool:
         return False
 
 
+def build_format_text(info: dict, formats: list) -> str:
+    """Build YouTube Saver style message with sizes"""
+    views = info.get("view_count", 0)
+    if views:
+        views_str = f"{views:,}"
+    else:
+        views_str = "N/A"
+
+    text = (
+        f"🎬 *{info['title'][:60]}*\n\n"
+        f"👤 {info['uploader']}\n"
+        f"⏱ {info['duration']}\n\n"
+    )
+
+    # Show each quality with size
+    for fmt in formats:
+        if fmt["quality"] == "audio":
+            icon = "✅" if fmt["filesize"] else "🎵"
+            text += f"{icon}  MP3:    {fmt['size_str']}\n"
+        else:
+            icon = "✅" if fmt["filesize"] else "🚀"
+            text += f"{icon}  {fmt['quality']}:    {fmt['size_str']}\n"
+
+    text += "\n⬇️ *Select quality to download:*"
+    return text
+
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎬 *Social Media Video Downloader*\n\n"
+        "🎬 *Video Downloader Bot*\n\n"
         "Send me any video link!\n\n"
-        "✅ *Supported Platforms:*\n"
+        "✅ *Supported:*\n"
         "▶️ YouTube\n"
         "📸 Instagram\n"
         "📘 Facebook\n"
         "🐦 Twitter / X\n"
         "🎵 TikTok\n\n"
-        "📺 *All available qualities shown:*\n"
-        "144p • 240p • 360p • 480p\n"
-        "720p • 1080p • 1440p • 2160p\n"
-        "🎵 Audio only (MP3)\n\n"
-        "Just paste any video link! 🚀",
+        "Just paste a link! 🚀",
         parse_mode="Markdown"
     )
 
@@ -198,16 +252,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📖 *How to use:*\n\n"
         "1️⃣ Copy any video link\n"
         "2️⃣ Paste it here\n"
-        "3️⃣ Bot shows available qualities\n"
+        "3️⃣ See all qualities + file sizes\n"
         "4️⃣ Pick your quality\n"
         "5️⃣ Download! ✅\n\n"
-        "✅ *Supported:*\n"
-        "• YouTube (all qualities)\n"
-        "• Instagram (reels, posts)\n"
-        "• Facebook (videos)\n"
-        "• Twitter / X (videos)\n"
-        "• TikTok (videos)\n\n"
-        "📦 Max Telegram file size: 50MB",
+        "📦 Max file: 50MB\n"
+        "Files larger than 50MB cannot be sent via Telegram.",
         parse_mode="Markdown"
     )
 
@@ -221,7 +270,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Example:\n"
             "• https://youtube.com/watch?v=...\n"
             "• https://instagram.com/reel/...\n"
-            "• https://facebook.com/video/..."
+            "• https://tiktok.com/..."
         )
         return
 
@@ -229,50 +278,47 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if platform == "unknown":
         await update.message.reply_text(
             "❌ Unsupported platform!\n\n"
-            "Supported: YouTube, Instagram, Facebook, Twitter, TikTok"
+            "Supported: YouTube, Instagram,\nFacebook, Twitter, TikTok"
         )
         return
 
-    platform_icons = {
-        "youtube":   "▶️ YouTube",
-        "instagram": "📸 Instagram",
-        "facebook":  "📘 Facebook",
-        "twitter":   "🐦 Twitter/X",
-        "tiktok":    "🎵 TikTok"
-    }
-
-    status = await update.message.reply_text(
-        f"⏳ Fetching {platform_icons[platform]} video info..."
-    )
+    status = await update.message.reply_text("⏳ Fetching video info...")
 
     try:
-        info = await asyncio.to_thread(get_video_info, text)
-        formats = await asyncio.to_thread(get_video_formats, text)
+        video_data = await asyncio.to_thread(get_video_data, text)
 
-        if not formats:
+        if not video_data or not video_data.get("formats"):
             await status.edit_text(
-                "❌ Could not fetch video formats!\n\n"
-                "Possible reasons:\n"
-                "• Private video\n"
-                "• Invalid URL\n"
-                "• Platform blocked\n\n"
+                "❌ Could not fetch video!\n\n"
+                "• Private video?\n"
+                "• Invalid URL?\n\n"
                 "Please try another link."
             )
             return
 
-        ctx.user_data["url"] = text
-        ctx.user_data["platform"] = platform
+        info    = video_data["info"]
+        formats = video_data["formats"]
+
+        # Save data
+        ctx.user_data["url"]     = text
         ctx.user_data["formats"] = {f["quality"]: f for f in formats}
 
-        # Build quality buttons 2 per row
+        # Build message text with sizes
+        msg_text = build_format_text(info, formats)
+
+        # Build quality buttons
         keyboard = []
         row = []
         for fmt in formats:
+            if fmt["quality"] == "audio":
+                label = "🎵 MP3"
+            else:
+                label = f"📹 {fmt['quality']}"
             row.append(InlineKeyboardButton(
-                fmt["label"],
+                label,
                 callback_data=f"dl_{fmt['quality']}"
             ))
-            if len(row) == 2:
+            if len(row) == 3:
                 keyboard.append(row)
                 row = []
         if row:
@@ -281,13 +327,24 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Cancel", callback_data="cancel")
         ])
 
+        # Send thumbnail + info
+        thumbnail = info.get("thumbnail", "")
+        if thumbnail:
+            try:
+                await status.delete()
+                await update.message.reply_photo(
+                    photo=thumbnail,
+                    caption=msg_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+                return
+            except Exception:
+                pass
+
+        # Fallback without thumbnail
         await status.edit_text(
-            f"✅ *Video Found!*\n\n"
-            f"🎬 *{info['title'][:60]}*\n"
-            f"👤 {info['uploader']}\n"
-            f"⏱ Duration: {info['duration']}\n"
-            f"📺 Platform: {platform_icons[platform]}\n\n"
-            f"*Select quality to download:*",
+            msg_text,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -304,56 +361,63 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel":
         ctx.user_data.clear()
-        await query.message.edit_text("❌ Cancelled.")
+        await query.message.delete()
         return
 
     if data.startswith("dl_"):
         quality = data[3:]
-        url = ctx.user_data.get("url")
+        url     = ctx.user_data.get("url")
         formats = ctx.user_data.get("formats", {})
-        fmt = formats.get(quality)
+        fmt     = formats.get(quality)
 
         if not url or not fmt:
             await query.message.reply_text(
-                "❌ Session expired. Please send the link again."
+                "❌ Session expired!\nPlease send the link again."
             )
             return
 
-        await query.message.edit_text(
-            f"⏳ *Downloading {fmt['label']}...*\n\n"
-            f"Please wait 1-3 minutes... ⏱",
+        label = "MP3" if quality == "audio" else quality
+
+        # Check size warning
+        filesize = fmt.get("filesize", 0)
+        if filesize and filesize > 50 * 1024 * 1024:
+            await query.answer(
+                f"⚠️ File is {format_size(filesize)} — may be too large for Telegram!",
+                show_alert=True
+            )
+
+        await query.message.reply_text(
+            f"⏳ *Downloading {label}...*\n\n"
+            f"Please wait... ⏱",
             parse_mode="Markdown"
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            ext = "mp3" if quality == "audio" else "mp4"
+            ext      = "mp3" if quality == "audio" else "mp4"
             out_path = str(Path(tmp) / f"video.{ext}")
 
             success = await asyncio.to_thread(
                 download_video, url, quality, out_path
             )
 
-            # Find actual downloaded file
             files = list(Path(tmp).glob("*"))
             if not files or not success:
                 await query.message.reply_text(
                     "❌ Download failed!\n\n"
-                    "Try another quality or link."
+                    "Try another quality."
                 )
                 return
 
             actual_file = str(files[0])
-            file_size = Path(actual_file).stat().st_size
+            file_size   = Path(actual_file).stat().st_size
 
             if file_size > 50 * 1024 * 1024:
                 await query.message.reply_text(
-                    f"❌ File too large! "
-                    f"({file_size//(1024*1024)}MB > 50MB)\n\n"
+                    f"❌ File too large!\n"
+                    f"Size: {format_size(file_size)} > 50MB\n\n"
                     "Please try a lower quality!"
                 )
                 return
-
-            await query.message.reply_text("✅ Downloaded! Uploading... ⏫")
 
             with open(actual_file, "rb") as f:
                 if quality == "audio":
@@ -361,18 +425,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         chat_id=query.message.chat_id,
                         audio=f,
                         caption=(
-                            f"🎵 Audio downloaded!\n"
-                            f"📦 Size: {file_size//(1024*1024):.1f}MB"
-                        )
+                            f"🎵 *{ctx.user_data.get('formats', {}).get('audio', {}).get('quality', 'MP3')}*\n"
+                            f"📦 {format_size(file_size)}"
+                        ),
+                        parse_mode="Markdown"
                     )
                 else:
                     await ctx.bot.send_video(
                         chat_id=query.message.chat_id,
                         video=f,
                         caption=(
-                            f"✅ *Downloaded!*\n"
-                            f"📺 Quality: {quality}\n"
-                            f"📦 Size: {file_size//(1024*1024):.1f}MB"
+                            f"✅ *{quality}*\n"
+                            f"📦 {format_size(file_size)}"
                         ),
                         parse_mode="Markdown",
                         supports_streaming=True
@@ -399,4 +463,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-                            
+        

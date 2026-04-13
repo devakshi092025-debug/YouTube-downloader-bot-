@@ -1,8 +1,10 @@
 import os
+import json
 import logging
 import asyncio
 import threading
 import subprocess
+import tempfile
 from pathlib import Path
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,7 +36,9 @@ def health():
     return "OK", 200
 
 def keep_alive():
-    t = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT))
+    t = threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=PORT)
+    )
     t.daemon = True
     t.start()
     log.info(f"Keep-alive started on port {PORT}")
@@ -58,45 +62,70 @@ def detect_platform(url: str) -> str:
         return "unknown"
 
 
-def get_video_formats(url: str) -> list:
-    """Get all available formats using yt-dlp"""
+def get_video_info(url: str) -> dict:
     try:
         result = subprocess.run([
-            "yt-dlp", "--list-formats", "--no-playlist", url
-        ], capture_output=True, text=True, timeout=30)
+            "yt-dlp",
+            "--no-playlist",
+            "-J",
+            url
+        ], capture_output=True, text=True, timeout=60)
+        data = json.loads(result.stdout)
+        duration_secs = data.get("duration", 0) or 0
+        mins = int(duration_secs // 60)
+        secs = int(duration_secs % 60)
+        return {
+            "title": data.get("title", "Unknown"),
+            "duration": f"{mins}m {secs}s",
+            "uploader": data.get("uploader", "Unknown")
+        }
+    except Exception as e:
+        log.error(f"get_video_info error: {e}")
+        return {
+            "title": "Unknown",
+            "duration": "Unknown",
+            "uploader": "Unknown"
+        }
 
+
+def get_video_formats(url: str) -> list:
+    try:
+        result = subprocess.run([
+            "yt-dlp",
+            "--no-playlist",
+            "-J",
+            url
+        ], capture_output=True, text=True, timeout=60)
+
+        data = json.loads(result.stdout)
         formats = []
-        seen = set()
+        seen_heights = set()
 
-        for line in result.stdout.split("\n"):
-            # Parse format lines
-            parts = line.split()
-            if len(parts) < 3:
+        for f in data.get("formats", []):
+            height = f.get("height")
+            vcodec = f.get("vcodec", "none")
+
+            if not height or vcodec == "none":
                 continue
-            fmt_id = parts[0]
-            if not fmt_id.isdigit() and fmt_id not in ["ba", "bv", "b"]:
+            if height in seen_heights:
                 continue
 
-            # Look for resolution info
-            line_lower = line.lower()
-            for quality in ["4320p", "2160p", "1440p", "1080p", "720p",
-                            "480p", "360p", "240p", "144p"]:
-                if quality in line_lower and quality not in seen:
-                    seen.add(quality)
-                    # Get file extension
-                    ext = "mp4"
-                    for e in ["mp4", "webm", "mkv"]:
-                        if e in line_lower:
-                            ext = e
-                            break
-                    formats.append({
-                        "format_id": fmt_id,
-                        "quality": quality,
-                        "ext": ext,
-                        "label": f"📹 {quality} ({ext.upper()})"
-                    })
+            seen_heights.add(height)
+            quality = f"{height}p"
+            formats.append({
+                "format_id": str(f.get("format_id", "")),
+                "quality": quality,
+                "ext": "mp4",
+                "label": f"📹 {quality}"
+            })
 
-        # Add audio only option
+        # Sort highest to lowest
+        formats.sort(
+            key=lambda x: int(x["quality"].replace("p", "")),
+            reverse=True
+        )
+
+        # Add audio only
         formats.append({
             "format_id": "bestaudio",
             "quality": "audio",
@@ -104,23 +133,14 @@ def get_video_formats(url: str) -> list:
             "label": "🎵 Audio Only (MP3)"
         })
 
-        # Sort by quality
-        order = ["4320p", "2160p", "1440p", "1080p",
-                 "720p", "480p", "360p", "240p", "144p", "audio"]
-        formats.sort(key=lambda x: order.index(x["quality"])
-                     if x["quality"] in order else 99)
-
         return formats
 
-    except subprocess.TimeoutExpired:
-        return []
     except Exception as e:
         log.error(f"get_video_formats error: {e}")
         return []
 
 
 def download_video(url: str, quality: str, out_path: str) -> bool:
-    """Download video with yt-dlp"""
     try:
         if quality == "audio":
             cmd = [
@@ -141,7 +161,6 @@ def download_video(url: str, quality: str, out_path: str) -> bool:
                 "-o", out_path,
                 url
             ]
-
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         return result.returncode == 0
 
@@ -153,34 +172,12 @@ def download_video(url: str, quality: str, out_path: str) -> bool:
         return False
 
 
-def get_video_info(url: str) -> dict:
-    """Get video title and thumbnail"""
-    try:
-        result = subprocess.run([
-            "yt-dlp",
-            "--no-playlist",
-            "--print", "title",
-            "--print", "duration_string",
-            "--print", "uploader",
-            url
-        ], capture_output=True, text=True, timeout=30)
-
-        lines = result.stdout.strip().split("\n")
-        return {
-            "title": lines[0] if len(lines) > 0 else "Unknown",
-            "duration": lines[1] if len(lines) > 1 else "Unknown",
-            "uploader": lines[2] if len(lines) > 2 else "Unknown"
-        }
-    except:
-        return {"title": "Unknown", "duration": "Unknown", "uploader": "Unknown"}
-
-
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎬 *Social Media Video Downloader*\n\n"
-        "Send me any video link and I will download it!\n\n"
+        "Send me any video link!\n\n"
         "✅ *Supported Platforms:*\n"
         "▶️ YouTube\n"
         "📸 Instagram\n"
@@ -218,7 +215,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # Check if it's a URL
     if not text.startswith("http"):
         await update.message.reply_text(
             "❌ Please send a valid video URL!\n\n"
@@ -238,11 +234,11 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     platform_icons = {
-        "youtube": "▶️ YouTube",
+        "youtube":   "▶️ YouTube",
         "instagram": "📸 Instagram",
-        "facebook": "📘 Facebook",
-        "twitter": "🐦 Twitter/X",
-        "tiktok": "🎵 TikTok"
+        "facebook":  "📘 Facebook",
+        "twitter":   "🐦 Twitter/X",
+        "tiktok":    "🎵 TikTok"
     }
 
     status = await update.message.reply_text(
@@ -250,7 +246,6 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # Get video info and formats
         info = await asyncio.to_thread(get_video_info, text)
         formats = await asyncio.to_thread(get_video_formats, text)
 
@@ -265,12 +260,11 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Save URL for download
         ctx.user_data["url"] = text
         ctx.user_data["platform"] = platform
         ctx.user_data["formats"] = {f["quality"]: f for f in formats}
 
-        # Build quality buttons
+        # Build quality buttons 2 per row
         keyboard = []
         row = []
         for fmt in formats:
@@ -289,7 +283,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await status.edit_text(
             f"✅ *Video Found!*\n\n"
-            f"🎬 *{info['title'][:50]}*\n"
+            f"🎬 *{info['title'][:60]}*\n"
             f"👤 {info['uploader']}\n"
             f"⏱ Duration: {info['duration']}\n"
             f"📺 Platform: {platform_icons[platform]}\n\n"
@@ -331,7 +325,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             ext = "mp3" if quality == "audio" else "mp4"
             out_path = str(Path(tmp) / f"video.{ext}")
@@ -342,7 +335,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             # Find actual downloaded file
             files = list(Path(tmp).glob("*"))
-            if not files:
+            if not files or not success:
                 await query.message.reply_text(
                     "❌ Download failed!\n\n"
                     "Try another quality or link."
@@ -354,39 +347,45 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if file_size > 50 * 1024 * 1024:
                 await query.message.reply_text(
-                    f"❌ File too large for Telegram! ({file_size//(1024*1024)}MB > 50MB)\n\n"
+                    f"❌ File too large! "
+                    f"({file_size//(1024*1024)}MB > 50MB)\n\n"
                     "Please try a lower quality!"
                 )
                 return
 
-            await query.message.reply_text(
-                f"✅ Downloaded! Uploading... ⏫"
-            )
+            await query.message.reply_text("✅ Downloaded! Uploading... ⏫")
 
             with open(actual_file, "rb") as f:
                 if quality == "audio":
                     await ctx.bot.send_audio(
                         chat_id=query.message.chat_id,
                         audio=f,
-                        caption=f"🎵 Audio downloaded!\n📦 Size: {file_size//(1024*1024):.1f}MB"
+                        caption=(
+                            f"🎵 Audio downloaded!\n"
+                            f"📦 Size: {file_size//(1024*1024):.1f}MB"
+                        )
                     )
                 else:
                     await ctx.bot.send_video(
                         chat_id=query.message.chat_id,
                         video=f,
-                        caption=f"✅ *Downloaded!*\n📺 Quality: {quality}\n📦 Size: {file_size//(1024*1024):.1f}MB",
+                        caption=(
+                            f"✅ *Downloaded!*\n"
+                            f"📺 Quality: {quality}\n"
+                            f"📦 Size: {file_size//(1024*1024):.1f}MB"
+                        ),
                         parse_mode="Markdown",
                         supports_streaming=True
                     )
 
-            await query.message.reply_text("🎉 Done! Enjoy watching!")
+            await query.message.reply_text("🎉 Done! Enjoy! 🍿")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     keep_alive()
-    log.info("Starting Social Media Downloader Bot...")
+    log.info("Starting Downloader Bot...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
@@ -398,5 +397,6 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 
-main()
-  
+if __name__ == "__main__":
+    main()
+                            
